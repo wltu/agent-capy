@@ -2,6 +2,7 @@
 name = "agent-capy"
 version = "0.1.0"
 edition = "2024"
+default-run = "capy"
 
 [dependencies]
 anyhow = "1.0.104"
