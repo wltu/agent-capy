@@ -1,5 +1,20 @@
 use anyhow::Context;
+use clap::Parser;
 use serde::{Deserialize, Serialize};
+
+/// capy: a small coding agent that drives a local model
+#[derive(Parser, Debug)]
+#[command(author, version)]
+struct Args {
+    #[arg(short, long, default_value = "http://localhost:11434/v1")]
+    endpoint: String,
+
+    #[arg(short, long, default_value = "qwen3.8-27b")]
+    model: String,
+
+    /// The task for capy, e.g. "what does this repo do?"
+    task: String,
+}
 
 #[derive(Debug, Serialize)]
 struct Message {
@@ -44,15 +59,15 @@ const RESET: &str = "\x1b[0m";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let base_url =
-        std::env::var("CAPY_BASE_URL").unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
-    let url = format!("{base_url}/chat/completions");
+    let args = Args::parse();
+
+    let url = format!("{}/chat/completions", args.endpoint);
 
     let payload = PostData {
-        model: String::from("qwen3.8-27b"),
+        model: args.model,
         messages: vec![Message {
             role: String::from("user"),
-            content: String::from("Say hi in five words."),
+            content: args.task,
         }],
     };
 
@@ -69,7 +84,11 @@ async fn main() -> anyhow::Result<()> {
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await?;
-        anyhow::bail!("Failed to call the model: {status}: {body}");
+        let body = body.trim();
+        anyhow::bail!(
+            "model call failed ({status}): {body}\n\
+             hint: `ollama list` shows installed models; pass one with --model"
+        );
     }
 
     let data: ChatResponse = response
