@@ -1,0 +1,26 @@
+{
+    "id": "chatcmpl-675",
+    "object": "chat.completion",
+    "created": 1793871203,
+    "model": "qwen3.8-27b",
+    "system_fingerprint": "fp_ollama",
+    "choices": [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "Hello! How can I help you today?",
+                "reasoning": "I need to respond to a simple greeting. The user said \"Hello!\" which is a friendly, casual opening. I should respond with a greeting back, keeping it warm and inviting, perhaps offering to help with something. No need for complex thinking here, just a friendly and appropriate response."
+            },
+            "finish_reason": "stop"
+        }
+    ],
+    "usage": {
+        "prompt_tokens": 54,
+        "prompt_tokens_details": {
+            "cached_tokens": 0
+        },
+        "completion_tokens": 71,
+        "total_tokens": 125
+    }
+}
