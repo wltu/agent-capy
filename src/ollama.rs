@@ -1,4 +1,5 @@
 use crate::message::{Message, ToolCall};
+use crate::tools::ToolSpec;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
@@ -8,10 +9,11 @@ pub struct Reply {
     pub usage: Option<(u32, u32)>, // (prompt, completion); a small struct is nicer later
 }
 
-pub fn build_request(model: &str, messages: &[Message]) -> PostData {
+pub fn build_request(model: &str, messages: &[Message], tools: &[ToolSpec]) -> PostData {
     PostData {
         model: model.into(),
         messages: messages.iter().map(to_wire).collect(),
+        tools: tools.iter().map(WireTool::from).collect(),
     }
 }
 
@@ -20,8 +22,9 @@ pub async fn chat(
     url: &str,
     model: &str,
     messages: &[Message],
+    tools: &[ToolSpec],
 ) -> anyhow::Result<Reply> {
-    let payload = build_request(model, messages);
+    let payload = build_request(model, messages, tools);
 
     let response = client
         .post(url)
@@ -75,6 +78,8 @@ pub struct WireRequestMessage {
 pub struct PostData {
     pub model: String,
     pub messages: Vec<WireRequestMessage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<WireTool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,9 +187,26 @@ pub fn to_wire(m: &Message) -> WireRequestMessage {
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct WireTool {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub function: ToolSpec,
+}
+
+impl From<&ToolSpec> for WireTool {
+    fn from(t: &ToolSpec) -> Self {
+        WireTool {
+            kind: "function".into(),
+            function: t.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn converts_tool_call_reply() {
@@ -297,5 +319,32 @@ mod tests {
         assert_eq!(got["id"], sent["id"]);
         assert_eq!(got["type"], sent["type"]);
         assert_eq!(got["function"], sent["function"]);
+    }
+
+    #[test]
+    fn request_includes_tools_in_ollama_shape() {
+        let raw = include_str!("../fixtures/request_tools.json");
+        let fixture: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let sent = &fixture["tools"];
+
+        let tool = vec![ToolSpec {
+            name: "read_file".into(),
+            description: "Read a UTF-8 text file from the project and return its contents.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path relative to the project root" }
+                },
+                "required": ["path"]
+            }),
+        }];
+        let req = build_request("test", &[], &tool);
+        assert_eq!(serde_json::to_value(&req.tools).unwrap(), *sent);
+    }
+
+    #[test]
+    fn empty_tools_are_omitted() {
+        let v = serde_json::to_value(build_request("test", &[], &[])).unwrap();
+        assert!(v.get("tools").is_none());
     }
 }

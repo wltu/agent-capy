@@ -1,5 +1,6 @@
 mod message;
 mod ollama;
+mod tools;
 
 use clap::Parser;
 
@@ -44,15 +45,16 @@ async fn main() -> anyhow::Result<()> {
         message::Message::System(SYSTEM_PROMPT.replace("{cwd}", &cwd)),
         message::Message::User(args.task),
     ];
+    let tools = tools::specs();
     if args.dry_run {
-        let payload = ollama::build_request(model, &messages);
+        let payload = ollama::build_request(model, &messages, &tools);
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
 
     let client = reqwest::Client::new();
 
-    let reply = ollama::chat(&client, &url, model, &messages).await?;
+    let reply = ollama::chat(&client, &url, model, &messages, &tools).await?;
 
     if let Some(reasoning) = reply.reasoning {
         eprintln!("{DIM}{}{RESET}\n", reasoning.trim());
@@ -63,9 +65,9 @@ async fn main() -> anyhow::Result<()> {
         if let Some(message) = text {
             println!("{}", message);
         }
-        // tool_calls: step 3 wants these listed; print name and arguments for each
+        // tool_calls: print name and arguments for each
         for tool in tool_calls {
-            println!("Calling tools {} {}", tool.name, tool.arguments);
+            println!("→ {} {} {}", tool.id, tool.name, tool.arguments);
         }
     }
 
