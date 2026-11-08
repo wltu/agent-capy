@@ -1,3 +1,4 @@
+mod agent;
 mod message;
 mod ollama;
 mod tools;
@@ -45,38 +46,13 @@ async fn main() -> anyhow::Result<()> {
         message::Message::System(SYSTEM_PROMPT.replace("{cwd}", &cwd)),
         message::Message::User(args.task),
     ];
-    let tools = tools::specs();
     if args.dry_run {
-        let payload = ollama::build_request(model, &messages, &tools);
+        let payload = ollama::build_request(model, &messages, &tools::specs());
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
 
     let client = reqwest::Client::new();
-
-    let reply = ollama::chat(&client, &url, model, &messages, &tools).await?;
-
-    if let Some(reasoning) = reply.reasoning {
-        eprintln!("{DIM}{}{RESET}\n", reasoning.trim());
-    }
-
-    if let message::Message::Assistant { text, tool_calls } = &reply.message {
-        // text: print it if Some
-        if let Some(message) = text {
-            println!("{}", message);
-        }
-        // tool_calls: print name and arguments for each
-        for tool in tool_calls {
-            println!("→ {} {} {}", tool.id, tool.name, tool.arguments);
-        }
-    }
-
-    if let Some((prompt_tokens, completion_tokens)) = &reply.usage {
-        eprintln!(
-            "{DIM}tokens: {} in, {} out{RESET}",
-            prompt_tokens, completion_tokens
-        );
-    }
-
+    println!("{}", agent::run(&client, &url, model, messages).await?);
     Ok(())
 }

@@ -1,5 +1,4 @@
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // ToolResult is built by the agent loop (step 4)
 pub enum Message {
     System(String),
     User(String),
