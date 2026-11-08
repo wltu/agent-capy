@@ -2,9 +2,11 @@ use crate::message::ToolCall;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::AsyncReadExt;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 const READ_LIMIT: usize = 20_000;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolSpec {
@@ -28,14 +30,22 @@ pub fn specs() -> Vec<ToolSpec> {
                 "required": ["path"]
             }),
         },
-        // TODO(step 5): the approval prompt is the safety gate; no command runs without it
         ToolSpec {
             name: "bash".into(),
-            description: "Runs a shell command in the project root; the user approves each command; it returns stdout, stderr and the exit code".into(),
+            description: format!(
+                "Run a command with `bash -c` in the project root. The user approves each \
+                 command first; a declined command is a normal result. There is no terminal \
+                 and no stdin, so interactive programs fail: use non-interactive flags such as \
+                 `git commit -m`, `git --no-pager` and `-y`. Commands are killed after {} \
+                 seconds. Returns the exit status, then stdout, then stderr; each stream is cut \
+                 after its first {} KB.",
+                DEFAULT_TIMEOUT.as_secs(),
+                READ_LIMIT / 1000,
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "Command to run in the project root" }
+                    "command": { "type": "string", "description": "Command to run in the project root" },
                 },
                 "required": ["command"]
             }),
@@ -48,13 +58,84 @@ struct ReadFileArgs {
     path: String,
 }
 
-pub async fn run(call: &ToolCall) -> anyhow::Result<String> {
+#[derive(Deserialize)]
+struct BashArgs {
+    command: String,
+}
+
+pub async fn run(call: &ToolCall, approve: impl Fn(&str) -> bool) -> anyhow::Result<String> {
     match call.name.as_str() {
         "read_file" => {
             let args: ReadFileArgs = serde_json::from_str(&call.arguments)?;
             read_file(&args.path).await
         }
+        "bash" => {
+            let args: BashArgs = serde_json::from_str(&call.arguments)?;
+            // never ask the user to approve a blank command
+            if args.command.trim().is_empty() {
+                anyhow::bail!("bash needs a non-empty command");
+            }
+            if !approve(&args.command) {
+                return Ok(format!(
+                    "The user declined to run this command: {}\n\
+                     Do not run it or a variant of it. Continue without it, \
+                     or ask the user what to do instead.",
+                    args.command
+                ));
+            }
+            run_command(&args.command, DEFAULT_TIMEOUT).await
+        }
         other => anyhow::bail!("{other} is not available"),
+    }
+}
+
+async fn run_command(cmd: &str, timeout: Duration) -> anyhow::Result<String> {
+    let mut child = tokio::process::Command::new("bash")
+        .arg("-c")
+        .arg(cmd)
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to start bash")?;
+    let stdout = child.stdout.take().expect("piped");
+    let stderr = child.stderr.take().expect("piped");
+    let run = async { tokio::try_join!(read_capped(stdout), read_capped(stderr), child.wait()) };
+    // on timeout `child` is dropped at return, and kill_on_drop kills bash
+    let ((out, out_total), (err, err_total), status) = tokio::time::timeout(timeout, run)
+        .await
+        .map_err(|_| anyhow::anyhow!("command timed out after {timeout:?}"))?
+        .context("failed to read command output")?;
+
+    // stdout first and each stream capped on its own, so a flood of
+    // compiler warnings on stderr can't push the results out
+    let mut text = format!("{status}\n");
+    for (label, bytes, total) in [("stdout", out, out_total), ("stderr", err, err_total)] {
+        let s = truncate(String::from_utf8_lossy(&bytes).into_owned(), total);
+        let s = s.trim_end(); // trim_end, not trim: leading indentation matters
+        if !s.is_empty() {
+            text.push_str(&format!("{label}:\n{s}\n"));
+        }
+    }
+    Ok(text)
+}
+
+// Keeps the first READ_LIMIT (+4, see read_file) bytes and returns the full
+// byte count. It keeps reading past the cap and throws the rest away: if it
+// stopped, the child would block on a full pipe and never exit.
+async fn read_capped(mut r: impl AsyncRead + Unpin) -> std::io::Result<(Vec<u8>, usize)> {
+    let mut kept = Vec::new();
+    let mut total = 0;
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = r.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok((kept, total));
+        }
+        total += n;
+        let room = (READ_LIMIT + 4).saturating_sub(kept.len());
+        kept.extend_from_slice(&chunk[..n.min(room)]);
     }
 }
 
@@ -87,7 +168,7 @@ async fn read_file(path: &str) -> anyhow::Result<String> {
         .await
         .with_context(|| format!("failed to read file {path}"))?;
 
-    let mut contents = match String::from_utf8(bytes) {
+    let contents = match String::from_utf8(bytes) {
         Ok(s) => s,
         // an incomplete char at the very end is our own cut; keep what's before it
         Err(e) if e.utf8_error().error_len().is_none() => {
@@ -98,6 +179,11 @@ async fn read_file(path: &str) -> anyhow::Result<String> {
         }
         Err(_) => anyhow::bail!("{path} is not UTF-8 text"),
     };
+
+    Ok(truncate(contents, total as usize))
+}
+
+fn truncate(mut contents: String, total: usize) -> String {
     if contents.len() > READ_LIMIT {
         let keep = contents.floor_char_boundary(READ_LIMIT);
         contents.truncate(keep);
@@ -105,7 +191,7 @@ async fn read_file(path: &str) -> anyhow::Result<String> {
             "\n[truncated: showing the first {keep} of {total} bytes]."
         ));
     }
-    Ok(contents)
+    contents
 }
 
 #[cfg(test)]
@@ -138,7 +224,7 @@ mod tests {
 
     // What the model would see: Ok text as-is, Err as its message chain.
     async fn model_sees(call: &ToolCall) -> String {
-        match run(call).await {
+        match run(call, |_| true).await {
             Ok(text) => text,
             Err(e) => format!("{e:#}"),
         }
@@ -146,15 +232,17 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_returns_contents() {
-        let out = run(&call("read_file", json!({ "path": "Cargo.toml" })))
-            .await
-            .unwrap();
+        let out = run(&call("read_file", json!({ "path": "Cargo.toml" })), |_| {
+            true
+        })
+        .await
+        .unwrap();
         assert!(out.contains("[package]"), "{out}");
     }
 
     #[tokio::test]
     async fn missing_file_is_err_naming_the_path() {
-        let err = run(&call("read_file", json!({ "path": "nope.txt" })))
+        let err = run(&call("read_file", json!({ "path": "nope.txt" })), |_| true)
             .await
             .unwrap_err();
         // The model needs to know which path failed, not just "os error 2".
@@ -167,13 +255,15 @@ mod tests {
             arguments: "{oops".into(),
             ..call("read_file", json!({}))
         };
-        assert!(run(&not_json).await.is_err());
+        assert!(run(&not_json, |_| true).await.is_err());
         assert!(
-            run(&call("read_file", json!({}))).await.is_err(),
+            run(&call("read_file", json!({})), |_| true).await.is_err(),
             "missing path"
         );
         assert!(
-            run(&call("read_file", json!({ "path": 7 }))).await.is_err(),
+            run(&call("read_file", json!({ "path": 7 })), |_| true)
+                .await
+                .is_err(),
             "path not a string"
         );
     }
@@ -207,12 +297,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bash_says_not_available() {
-        let out = model_sees(&call("bash", json!({ "command": "ls" }))).await;
-        assert!(out.contains("not available"), "{out:?}");
-    }
-
-    #[tokio::test]
     async fn unknown_tool_names_the_tool() {
         let out = model_sees(&call("rm_rf", json!({}))).await;
         assert!(out.contains("rm_rf"), "{out:?}");
@@ -228,7 +312,7 @@ mod tests {
             let body = format!("{prefix}{}", "é".repeat(500_000)); // ~1 MB
             std::fs::write(&path, &body).unwrap();
 
-            let out = run(&call("read_file", json!({ "path": path })))
+            let out = run(&call("read_file", json!({ "path": path })), |_| true)
                 .await
                 .unwrap();
 
@@ -244,5 +328,122 @@ mod tests {
             );
             std::fs::remove_file(&path).ok();
         }
+    }
+
+    #[tokio::test]
+    async fn run_command_echo_hi() {
+        let out = model_sees(&call("bash", json!({ "command": "echo hi" }))).await;
+        assert!(out.contains("exit status: 0"), "{out}");
+        assert!(out.contains("hi"), "stdout missing hi: {out}");
+    }
+
+    #[tokio::test]
+    async fn run_command_exit_3() {
+        let out = model_sees(&call("bash", json!({ "command": "exit 3" }))).await;
+        assert!(out.contains("exit status: 3"), "{out}");
+    }
+
+    // generous: bash can be slow to start when many tests spawn it at once
+    const ENOUGH: Duration = Duration::from_secs(5);
+
+    #[tokio::test]
+    async fn failing_command_shows_stdout_stderr_and_code() {
+        let out = run_command("echo partial; echo oops >&2; exit 3", ENOUGH)
+            .await
+            .unwrap();
+        assert!(out.contains("exit status: 3"), "{out}");
+        assert!(out.contains("partial"), "stdout lost on failure: {out}");
+        assert!(out.contains("oops"), "stderr lost: {out}");
+    }
+
+    #[tokio::test]
+    async fn signal_killed_command_is_reported() {
+        // code() is None here; the model still needs to see something
+        let out = run_command("kill -9 $$", ENOUGH).await.unwrap();
+        assert!(out.contains("signal"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn slow_command_times_out_quickly() {
+        let start = std::time::Instant::now();
+        let err = run_command("sleep 5", Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        assert!(start.elapsed() < Duration::from_secs(2), "waited for sleep");
+    }
+
+    // kill_on_drop: without it, bash keeps running after the timeout and touches the file.
+    #[tokio::test]
+    async fn timed_out_command_is_killed() {
+        let marker = format!("target/capy_killed_{}", std::process::id());
+        let cmd = format!("sleep 0.5; touch {marker}");
+        assert!(run_command(&cmd, Duration::from_millis(100)).await.is_err());
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let survived = std::path::Path::new(&marker).exists();
+        std::fs::remove_file(&marker).ok();
+        assert!(!survived, "command kept running after the timeout");
+    }
+
+    // Stdio::null: `cat` with no file reads stdin; inherited stdin would hang to the timeout.
+    #[tokio::test]
+    async fn command_gets_no_stdin() {
+        let out = run_command("cat", ENOUGH).await.unwrap();
+        assert!(out.contains("exit status: 0"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn runs_in_the_project_root() {
+        let out = run_command("pwd", ENOUGH).await.unwrap();
+        assert!(out.contains(env!("CARGO_MANIFEST_DIR")), "{out}");
+    }
+
+    #[tokio::test]
+    async fn non_utf8_output_is_not_an_error() {
+        let out = run_command(r"printf '\xff\xfe'", ENOUGH).await.unwrap();
+        assert!(out.contains("exit status: 0"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn empty_command_is_err_without_asking() {
+        for cmd in ["", "   ", "\n\t"] {
+            let res = run(&call("bash", json!({ "command": cmd })), |_| {
+                panic!("asked to approve {cmd:?}")
+            })
+            .await;
+            assert!(res.is_err(), "{cmd:?}: {res:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn huge_output_is_truncated() {
+        // 200 KB is past both the cap and the pipe buffer: finishing at all
+        // proves read_capped keeps draining
+        let out = run_command("head -c 200000 /dev/zero | tr '\\0' a", ENOUGH)
+            .await
+            .unwrap();
+        assert!(out.len() < 30_000, "not truncated: {}", out.len());
+        assert!(
+            out.contains("of 200000 bytes"),
+            "{}",
+            &out[out.len() - 80..]
+        );
+        assert!(out.contains("[truncated"), "{}", &out[out.len() - 80..]);
+        assert!(out.starts_with("exit status: 0"), "exit code cut off");
+    }
+
+    #[tokio::test]
+    async fn big_stderr_does_not_hide_stdout() {
+        let cmd = "head -c 200000 /dev/zero | tr '\\0' w >&2; echo RESULT";
+        let out = run_command(cmd, ENOUGH).await.unwrap();
+        assert!(out.contains("RESULT"), "stdout lost behind stderr");
+    }
+
+    #[tokio::test]
+    async fn leading_indentation_is_kept() {
+        let out = run_command("printf '    indented\\n'", ENOUGH)
+            .await
+            .unwrap();
+        assert!(out.contains("\n    indented"), "{out:?}");
     }
 }

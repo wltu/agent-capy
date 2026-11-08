@@ -10,6 +10,7 @@ pub async fn run(
     url: &str,
     model: &str,
     mut history: Vec<Message>,
+    approve: impl Fn(&str) -> bool,
 ) -> anyhow::Result<String> {
     let specs = tools::specs();
     for _ in 0..MAX_TURNS {
@@ -38,7 +39,9 @@ pub async fn run(
             eprintln!("{DIM}→ {} {}{RESET}", tool.name, tool.arguments);
             let tool_result = Message::ToolResult {
                 call_id: tool.id.clone(),
-                content: tools::run(tool).await.unwrap_or_else(|e| format!("{e:#}")),
+                content: tools::run(tool, &approve)
+                    .await
+                    .unwrap_or_else(|e| format!("{e:#}")),
             };
             history.push(tool_result);
         }
@@ -118,10 +121,13 @@ mod tests {
         json!({ "choices": [{ "message": { "role": "assistant", "content": "", "tool_calls": calls } }] })
     }
 
-    async fn run_with(replies: Vec<Value>) -> (anyhow::Result<String>, Vec<Value>) {
+    async fn run_with(
+        replies: Vec<Value>,
+        approve: impl Fn(&str) -> bool,
+    ) -> (anyhow::Result<String>, Vec<Value>) {
         let (url, seen) = fake_ollama(replies).await;
         let history = vec![Message::User("task".into())];
-        let out = run(&reqwest::Client::new(), &url, "fake", history).await;
+        let out = run(&reqwest::Client::new(), &url, "fake", history, approve).await;
         let requests = seen.lock().unwrap().clone();
         (out, requests)
     }
@@ -133,14 +139,14 @@ mod tests {
 
     #[tokio::test]
     async fn plain_answer_takes_one_turn() {
-        let (out, requests) = run_with(vec![text_reply("hi")]).await;
+        let (out, requests) = run_with(vec![text_reply("hi")], |_| true).await;
         assert_eq!(out.unwrap(), "hi");
         assert_eq!(requests.len(), 1);
     }
 
     #[tokio::test]
     async fn empty_reply_returns_instead_of_looping() {
-        let (out, requests) = run_with(vec![text_reply("")]).await;
+        let (out, requests) = run_with(vec![text_reply("")], |_| true).await;
         assert!(out.is_ok(), "{out:?}");
         assert_eq!(
             requests.len(),
@@ -151,10 +157,13 @@ mod tests {
 
     #[tokio::test]
     async fn tool_result_follows_its_call_then_answer() {
-        let (out, requests) = run_with(vec![
-            tool_reply(&[("c1", "read_file", json!({ "path": "Cargo.toml" }))]),
-            text_reply("done"),
-        ])
+        let (out, requests) = run_with(
+            vec![
+                tool_reply(&[("c1", "read_file", json!({ "path": "Cargo.toml" }))]),
+                text_reply("done"),
+            ],
+            |_| true,
+        )
         .await;
         assert_eq!(out.unwrap(), "done");
         assert_eq!(requests.len(), 2);
@@ -171,14 +180,17 @@ mod tests {
 
     #[tokio::test]
     async fn every_call_gets_one_result_in_order() {
-        let (out, requests) = run_with(vec![
-            tool_reply(&[
-                ("c1", "read_file", json!({ "path": "Cargo.toml" })),
-                ("c2", "read_file", json!({ "path": "nope.txt" })),
-                ("c3", "bash", json!({ "command": "ls" })),
-            ]),
-            text_reply("done"),
-        ])
+        let (out, requests) = run_with(
+            vec![
+                tool_reply(&[
+                    ("c1", "read_file", json!({ "path": "Cargo.toml" })),
+                    ("c2", "read_file", json!({ "path": "nope.txt" })),
+                    ("c3", "bash", json!({ "command": "ls" })),
+                ]),
+                text_reply("done"),
+            ],
+            |_| false,
+        )
         .await;
         assert_eq!(out.unwrap(), "done");
 
@@ -195,23 +207,82 @@ mod tests {
             results[2]["content"]
                 .as_str()
                 .unwrap()
-                .contains("not available")
+                .contains("The user declined to run this command")
         );
     }
 
     #[tokio::test]
     async fn stops_after_max_turns() {
         // the model asks for the same file forever
-        let (out, requests) = run_with(vec![tool_reply(&[(
-            "c1",
-            "read_file",
-            json!({ "path": "Cargo.toml" }),
-        )])])
+        let (out, requests) = run_with(
+            vec![tool_reply(&[(
+                "c1",
+                "read_file",
+                json!({ "path": "Cargo.toml" }),
+            )])],
+            |_| true,
+        )
         .await;
         assert!(
             out.is_err(),
             "expected an error after MAX_TURNS, got {out:?}"
         );
         assert_eq!(requests.len(), MAX_TURNS as usize);
+    }
+
+    // Runs one `touch {path}` call through the agent with the given approver.
+    // Returns the tool message the model saw and whether the file now exists.
+    async fn touch_through_agent(name: &str, approve: impl Fn(&str) -> bool) -> (String, bool) {
+        let path = format!("target/capy_{name}_{}", std::process::id());
+        std::fs::remove_file(&path).ok(); // a leftover would fake the result
+        let (out, requests) = run_with(
+            vec![
+                tool_reply(&[("c1", "bash", json!({ "command": format!("touch {path}") }))]),
+                text_reply("ok"),
+            ],
+            approve,
+        )
+        .await;
+        assert_eq!(out.unwrap(), "ok");
+        let tool_msg = messages(&requests, 1)
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("a tool result")["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let exists = std::path::Path::new(&path).exists();
+        std::fs::remove_file(&path).ok();
+        (tool_msg, exists)
+    }
+
+    #[tokio::test]
+    async fn declined_command_does_not_run() {
+        // Fn closures can't mutate captures directly; RefCell allows it at runtime
+        let asked = std::cell::RefCell::new(Vec::new());
+        let (tool_msg, exists) = touch_through_agent("declined", |cmd| {
+            asked.borrow_mut().push(cmd.to_string());
+            false
+        })
+        .await;
+        assert!(!exists, "declined command ran anyway");
+        assert!(
+            tool_msg.contains("The user declined to run this command"),
+            "{tool_msg}"
+        );
+        // the user must be shown the command itself, not the JSON arguments
+        let asked = asked.into_inner();
+        assert_eq!(asked.len(), 1, "asked {asked:?}");
+        assert!(
+            asked[0].starts_with("touch target/capy_declined_"),
+            "{asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_command_runs() {
+        let (tool_msg, exists) = touch_through_agent("approved", |_| true).await;
+        assert!(exists, "approved command didn't run");
+        assert!(tool_msg.contains("exit status: 0"), "{tool_msg}");
     }
 }
