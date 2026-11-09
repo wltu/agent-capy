@@ -2,7 +2,7 @@ use crate::message::ToolCall;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::{fmt, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const READ_LIMIT: usize = 20_000;
@@ -15,42 +15,67 @@ pub struct ToolSpec {
     pub parameters: Value,
 }
 
+// Supported Tools for Capy
+#[derive(Debug, Copy, Clone)]
+pub enum Tool {
+    ReadFile,
+    Bash,
+}
+
+const ALL_TOOLS: [Tool; 2] = [Tool::ReadFile, Tool::Bash];
+
+impl fmt::Display for Tool {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Tool::ReadFile => "read_file",
+            Tool::Bash => "bash",
+        };
+        write!(f, "{}", name)
+    }
+}
+
+impl From<Tool> for ToolSpec {
+    fn from(t: Tool) -> Self {
+        match t {
+            Tool::ReadFile => ToolSpec {
+                name: t.to_string(),
+                description: "Read a UTF-8 text file from the project and return its contents. \
+                              Paths are relative to the project root; large files are truncated."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Path relative to the project root" }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            Tool::Bash => ToolSpec {
+                name: t.to_string(),
+                description: format!(
+                    "Run a command with `bash -c` in the project root. The user approves each \
+                     command first; a declined command is a normal result. There is no terminal \
+                     and no stdin, so interactive programs fail: use non-interactive flags such as \
+                     `git commit -m`, `git --no-pager` and `-y`. Commands are killed after {} \
+                     seconds. Returns the exit status, then stdout, then stderr; each stream is cut \
+                     after its first {} KB.",
+                    DEFAULT_TIMEOUT.as_secs(),
+                    READ_LIMIT / 1000,
+                ),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "Command to run in the project root" },
+                    },
+                    "required": ["command"]
+                }),
+            },
+        }
+    }
+}
+
 pub fn specs() -> Vec<ToolSpec> {
-    vec![
-        ToolSpec {
-            name: "read_file".into(),
-            description: "Read a UTF-8 text file from the project and return its contents. \
-                          Paths are relative to the project root; large files are truncated."
-                .into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path relative to the project root" }
-                },
-                "required": ["path"]
-            }),
-        },
-        ToolSpec {
-            name: "bash".into(),
-            description: format!(
-                "Run a command with `bash -c` in the project root. The user approves each \
-                 command first; a declined command is a normal result. There is no terminal \
-                 and no stdin, so interactive programs fail: use non-interactive flags such as \
-                 `git commit -m`, `git --no-pager` and `-y`. Commands are killed after {} \
-                 seconds. Returns the exit status, then stdout, then stderr; each stream is cut \
-                 after its first {} KB.",
-                DEFAULT_TIMEOUT.as_secs(),
-                READ_LIMIT / 1000,
-            ),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string", "description": "Command to run in the project root" },
-                },
-                "required": ["command"]
-            }),
-        },
-    ]
+    ALL_TOOLS.iter().copied().map(ToolSpec::from).collect()
 }
 
 #[derive(Deserialize)]
@@ -64,13 +89,28 @@ struct BashArgs {
 }
 
 pub async fn run(call: &ToolCall, approve: impl Fn(&str) -> bool) -> anyhow::Result<String> {
-    match call.name.as_str() {
-        "read_file" => {
-            let args: ReadFileArgs = serde_json::from_str(&call.arguments)?;
+    let name = call.name.as_str();
+    match ALL_TOOLS.iter().find(|t| t.to_string() == name) {
+        Some(Tool::ReadFile) => {
+            let args: ReadFileArgs = serde_json::from_str(&call.arguments).with_context(|| {
+                format!(
+                    "{} expected {}: got {}",
+                    call.name,
+                    ToolSpec::from(Tool::ReadFile).parameters,
+                    call.arguments
+                )
+            })?;
             read_file(&args.path).await
         }
-        "bash" => {
-            let args: BashArgs = serde_json::from_str(&call.arguments)?;
+        Some(Tool::Bash) => {
+            let args: BashArgs = serde_json::from_str(&call.arguments).with_context(|| {
+                format!(
+                    "{} expected {}: got {}",
+                    call.name,
+                    ToolSpec::from(Tool::Bash).parameters,
+                    call.arguments
+                )
+            })?;
             // never ask the user to approve a blank command
             if args.command.trim().is_empty() {
                 anyhow::bail!("bash needs a non-empty command");
@@ -85,7 +125,14 @@ pub async fn run(call: &ToolCall, approve: impl Fn(&str) -> bool) -> anyhow::Res
             }
             run_command(&args.command, DEFAULT_TIMEOUT).await
         }
-        other => anyhow::bail!("{other} is not available"),
+        None => anyhow::bail!(
+            "unknown tool {name}: available tools {}",
+            ALL_TOOLS
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -255,17 +302,16 @@ mod tests {
             arguments: "{oops".into(),
             ..call("read_file", json!({}))
         };
-        assert!(run(&not_json, |_| true).await.is_err());
-        assert!(
-            run(&call("read_file", json!({})), |_| true).await.is_err(),
-            "missing path"
-        );
-        assert!(
-            run(&call("read_file", json!({ "path": 7 })), |_| true)
-                .await
-                .is_err(),
-            "path not a string"
-        );
+        let err = model_sees(&not_json).await;
+        assert!(err.contains("read_file") && err.contains("path"), "{err}");
+        let err = model_sees(&call("read_file", json!({}))).await;
+        assert!(err.contains("read_file") && err.contains("path"), "{err}");
+        let err = model_sees(&call("read_file", json!({ "path": 7 }))).await;
+        assert!(err.contains("read_file") && err.contains("path"), "{err}");
+        let err = model_sees(&call("bash", json!({}))).await;
+        assert!(err.contains("bash") && err.contains("command"), "{err}");
+        let err = model_sees(&call("bash", json!({ "command": 7 }))).await;
+        assert!(err.contains("bash") && err.contains("command"), "{err}");
     }
 
     #[tokio::test]
@@ -298,8 +344,10 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_tool_names_the_tool() {
-        let out = model_sees(&call("rm_rf", json!({}))).await;
-        assert!(out.contains("rm_rf"), "{out:?}");
+        let out = model_sees(&call("web_search", json!({}))).await;
+        assert!(out.contains("unknown tool web_search"), "{out}");
+        assert!(out.contains("read_file"), "{out}");
+        assert!(out.contains("bash"), "{out}");
     }
 
     // Two files whose char boundaries fall on even vs odd bytes, so whatever
