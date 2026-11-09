@@ -49,14 +49,14 @@ pub async fn run(
             );
         }
 
-        let Message::Assistant { text, tool_calls } = &reply.message else {
-            unreachable!("ollama::chat always returns Message::Assistant")
-        };
-        history.push(reply.message.clone());
+        history.push(Message::Assistant {
+            text: reply.text.clone(),
+            tool_calls: reply.tool_calls.clone(),
+        });
 
-        if tool_calls.is_empty() {
-            return match text {
-                Some(t) if !t.trim().is_empty() => Ok(t.clone()),
+        if reply.tool_calls.is_empty() {
+            return match reply.text {
+                Some(t) if !t.trim().is_empty() => Ok(t),
                 _ => anyhow::bail!(
                     "the model ended without an answer (any reasoning it gave is shown above). \
                      Try rephrasing the task, or another --model."
@@ -64,7 +64,7 @@ pub async fn run(
             };
         }
 
-        for tool in tool_calls {
+        for tool in &reply.tool_calls {
             tools_run += 1;
             eprintln!("{DIM}→ {} {}{RESET}", tool.name, tool.arguments);
             let tool_result = Message::ToolResult {

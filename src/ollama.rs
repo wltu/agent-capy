@@ -4,7 +4,8 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 pub struct Reply {
-    pub message: Message,          // Assistant { text, tool_calls }
+    pub text: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
     pub reasoning: Option<String>, // display only, never sent back
     pub usage: Option<(u32, u32)>, // (prompt, completion); a small struct is nicer later
 }
@@ -63,10 +64,19 @@ pub async fn chat(
         .context("Ollama returned no choices")?
         .message;
     let reasoning = wire.reasoning.take(); // move it out before `.into()` consumes `wire`
-    let message: Message = wire.into();
 
     Ok(Reply {
-        message,
+        text: wire.content.filter(|c| !c.is_empty()),
+        tool_calls: wire
+            .tool_calls
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tool_call| ToolCall {
+                id: tool_call.id,
+                name: tool_call.function.name,
+                arguments: tool_call.function.arguments,
+            })
+            .collect(),
         reasoning,
         usage: usage.map(|u| (u.prompt_tokens, u.completion_tokens)),
     })
