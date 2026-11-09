@@ -2,6 +2,7 @@
 name = "agent-capy"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99" # the toolchain this is tested on; lower it after checking with `cargo msrv`
 default-run = "capy"
 
 [dependencies]
