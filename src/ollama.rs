@@ -32,20 +32,29 @@ pub async fn chat(
         .send()
         .await
         .with_context(|| format!("couldn't reach Ollama at {url}. Is `ollama serve` running?"))?;
-    if !response.status().is_success() {
-        let status = response.status();
+    let status = response.status();
+    if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
-        let body = body.trim();
         anyhow::bail!(
-            "model call failed ({status}): {body}\n\
-             hint: `ollama list` shows installed models; pass one with --model"
+            "model call failed ({status}): {}{}",
+            snippet(&body),
+            status_hint(status)
         );
     }
 
-    let data: ChatResponse = response
-        .json()
+    // text first, then parse: `.json()` would consume the body, leaving
+    // nothing to show when parsing fails
+    let body = response
+        .text()
         .await
-        .context("Ollama sent a response capy can't parse")?;
+        .context("couldn't read Ollama's response")?;
+    let data: ChatResponse = serde_json::from_str(&body).with_context(|| {
+        format!(
+            "Ollama sent a response capy can't parse ({} bytes): {}",
+            body.len(),
+            snippet(&body)
+        )
+    })?;
 
     let ChatResponse { choices, usage } = data; // split the struct
     let mut wire = choices
@@ -61,6 +70,40 @@ pub async fn chat(
         reasoning,
         usage: usage.map(|u| (u.prompt_tokens, u.completion_tokens)),
     })
+}
+
+const SNIPPET_LIMIT: usize = 200;
+
+// Bodies can be huge (or sensitive), so errors show only the start.
+fn snippet(body: &str) -> String {
+    let body = body.trim();
+    if body.len() <= SNIPPET_LIMIT {
+        return body.to_string();
+    }
+    let cut = body.floor_char_boundary(SNIPPET_LIMIT);
+    format!("{}… [first {cut} of {} bytes]", &body[..cut], body.len())
+}
+
+// What to try next, by status. Specific codes come before the range guards.
+fn status_hint(status: reqwest::StatusCode) -> &'static str {
+    use reqwest::StatusCode;
+    match status {
+        StatusCode::NOT_FOUND => {
+            "\nhint: `ollama list` shows installed models; check --model and --endpoint"
+        }
+        StatusCode::BAD_REQUEST => {
+            "\nhint: the message above says why. If it's about tools, pick a model that \
+             supports them; otherwise run with --dry-run to see the request"
+        }
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
+            "\nhint: Ollama is busy; try again shortly"
+        }
+        s if s.is_server_error() => {
+            "\nhint: check the Ollama server log; the model may not fit in memory, \
+             so a smaller one may work"
+        }
+        _ => "",
+    }
 }
 
 #[derive(Debug, Serialize)]

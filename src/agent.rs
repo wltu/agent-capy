@@ -2,6 +2,7 @@ use crate::message::Message;
 use crate::ollama;
 use crate::tools;
 use crate::{DIM, RESET};
+use anyhow::Context;
 
 pub async fn run(
     client: &reqwest::Client,
@@ -12,8 +13,18 @@ pub async fn run(
     approve: impl Fn(&str) -> bool,
 ) -> anyhow::Result<String> {
     let specs = tools::specs();
-    for _ in 0..max_turns {
-        let reply = ollama::chat(client, url, model, &history, &specs).await?;
+    let mut tools_run = 0;
+    for turn in 1..=max_turns {
+        // say what already happened: earlier commands' effects remain
+        let reply = ollama::chat(client, url, model, &history, &specs)
+            .await
+            .with_context(|| match tools_run {
+                0 => format!("model call failed on turn {turn}"),
+                n => format!(
+                    "model call failed on turn {turn}; {n} tool call(s) already ran \
+                     and their effects remain"
+                ),
+            })?;
         if let Some(reasoning) = reply.reasoning {
             eprintln!("{DIM}{}{RESET}\n", reasoning.trim());
         }
@@ -31,10 +42,17 @@ pub async fn run(
         history.push(reply.message.clone());
 
         if tool_calls.is_empty() {
-            return Ok(text.clone().unwrap_or_else(|| "(no answer)".into()));
+            return match text {
+                Some(t) if !t.trim().is_empty() => Ok(t.clone()),
+                _ => anyhow::bail!(
+                    "the model ended without an answer (any reasoning it gave is shown above). \
+                     Try rephrasing the task, or another --model."
+                ),
+            };
         }
 
         for tool in tool_calls {
+            tools_run += 1;
             eprintln!("{DIM}→ {} {}{RESET}", tool.name, tool.arguments);
             let tool_result = Message::ToolResult {
                 call_id: tool.id.clone(),
@@ -61,9 +79,9 @@ mod tests {
 
     type Seen = Arc<Mutex<Vec<Value>>>;
 
-    // A fake Ollama: answers each request with the next canned reply (the last
-    // one repeats forever) and records every request body it received.
-    async fn fake_ollama(replies: Vec<Value>) -> (String, Seen) {
+    // A fake Ollama: answers each request with the next canned (status, body)
+    // (the last one repeats forever) and records every request body it received.
+    async fn fake_ollama(replies: Vec<(u16, String)>) -> (String, Seen) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
         let seen: Seen = Arc::default();
@@ -73,9 +91,9 @@ mod tests {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 let request = read_json(&mut sock).await; // lock after the await, not across it
                 log.lock().unwrap().push(request);
-                let body = replies[i.min(replies.len() - 1)].to_string();
+                let (status, body) = &replies[i.min(replies.len() - 1)];
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                    "HTTP/1.1 {status} Fake\r\nContent-Type: application/json\r\n\
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
@@ -135,19 +153,42 @@ mod tests {
         approve: impl Fn(&str) -> bool,
         max_turns: u32,
     ) -> (anyhow::Result<String>, Vec<Value>) {
+        let replies = replies.iter().map(|v| (200, v.to_string())).collect();
+        run_raw(replies, approve, max_turns).await
+    }
+
+    // Like run_with, but each reply is a raw (status, body), for failure cases.
+    async fn run_raw(
+        replies: Vec<(u16, String)>,
+        approve: impl Fn(&str) -> bool,
+        max_turns: u32,
+    ) -> (anyhow::Result<String>, Vec<Value>) {
         let (url, seen) = fake_ollama(replies).await;
+        let out = run_at(&url, approve, max_turns).await;
+        let requests = seen.lock().unwrap().clone();
+        (out, requests)
+    }
+
+    async fn run_at(
+        url: &str,
+        approve: impl Fn(&str) -> bool,
+        max_turns: u32,
+    ) -> anyhow::Result<String> {
         let history = vec![Message::User("task".into())];
-        let out = run(
+        run(
             &reqwest::Client::new(),
-            &url,
+            url,
             "fake",
             max_turns,
             history,
             approve,
         )
-        .await;
-        let requests = seen.lock().unwrap().clone();
-        (out, requests)
+        .await
+    }
+
+    // The full error chain, as main would print it.
+    fn err_text(out: anyhow::Result<String>) -> String {
+        format!("{:#}", out.expect_err("expected the run to fail"))
     }
 
     // The `messages` array of request `i`.
@@ -163,14 +204,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_reply_returns_instead_of_looping() {
-        let (out, requests) = run_with(vec![text_reply("")], |_| true).await;
-        assert!(out.is_ok(), "{out:?}");
+    async fn empty_reply_is_an_error_without_looping() {
+        let (out, requests) = run_with(vec![text_reply("  ")], |_| true).await;
+        let msg = err_text(out);
+        assert!(msg.contains("without an answer"), "{msg}");
         assert_eq!(
             requests.len(),
             1,
             "called the model again after an empty answer"
         );
+    }
+
+    #[tokio::test]
+    async fn http_errors_show_status_body_and_hint() {
+        for (status, body, hint) in [
+            (
+                404,
+                r#"{"error":"model \"fake\" not found"}"#,
+                "ollama list",
+            ),
+            (
+                400,
+                r#"{"error":"fake does not support tools"}"#,
+                "--dry-run",
+            ),
+            (500, r#"{"error":"out of memory"}"#, "server log"),
+        ] {
+            let (out, requests) = run_raw(vec![(status, body.into())], |_| true, 10).await;
+            let msg = err_text(out);
+            assert!(msg.contains(&status.to_string()), "{status}: {msg}");
+            assert!(msg.contains("error"), "{status}: body missing: {msg}");
+            assert!(msg.contains(hint), "{status}: {msg}");
+            assert_eq!(requests.len(), 1, "{status}: retried");
+        }
+    }
+
+    #[tokio::test]
+    async fn unparseable_body_is_capped_and_sized() {
+        let garbage = "x".repeat(10_000);
+        let (out, _) = run_raw(vec![(200, garbage)], |_| true, 10).await;
+        let msg = err_text(out);
+        assert!(msg.contains("can't parse"), "{msg}");
+        assert!(msg.contains("10000 bytes"), "{msg}");
+        assert!(
+            msg.len() < 1_000,
+            "printed the whole body: {} bytes",
+            msg.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_ollama_names_the_url() {
+        // bind a free port, then close it, so nothing is listening there
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
+        drop(listener);
+        let msg = err_text(run_at(&url, |_| true, 10).await);
+        assert!(msg.contains(&url), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn mid_run_failure_says_what_already_ran() {
+        let call = tool_reply(&[("c1", "read_file", json!({ "path": "Cargo.toml" }))]);
+        let (out, requests) = run_raw(
+            vec![(200, call.to_string()), (500, "boom".into())],
+            |_| true,
+            10,
+        )
+        .await;
+        let msg = err_text(out);
+        assert!(
+            msg.contains("turn 2") && msg.contains("1 tool call"),
+            "{msg}"
+        );
+        assert!(msg.contains("500"), "{msg}");
+        assert_eq!(requests.len(), 2);
     }
 
     #[tokio::test]
