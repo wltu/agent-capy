@@ -152,7 +152,13 @@ async fn run_command(cmd: &str, timeout: Duration) -> anyhow::Result<String> {
     // on timeout `child` is dropped at return, and kill_on_drop kills bash
     let ((out, out_total), (err, err_total), status) = tokio::time::timeout(timeout, run)
         .await
-        .map_err(|_| anyhow::anyhow!("command timed out after {timeout:?}"))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "command timed out and was killed after {timeout:?}. It may have partly run \
+                 (check for changes it made); its output is not shown. Try a faster command, \
+                 limit its work (e.g. one test, `head`), or run it in the background."
+            )
+        })?
         .context("failed to read command output")?;
 
     // stdout first and each stream capped on its own, so a flood of
@@ -417,7 +423,9 @@ mod tests {
         let err = run_command("sleep 5", Duration::from_millis(200))
             .await
             .unwrap_err();
-        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("timed out") && msg.contains("200ms"), "{msg}");
+        assert!(msg.contains("partly run"), "{msg}");
         assert!(start.elapsed() < Duration::from_secs(2), "waited for sleep");
     }
 
