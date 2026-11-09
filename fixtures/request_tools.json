@@ -1,0 +1,30 @@
+{
+  "model": "qwen3.8-27b",
+  "messages": [
+    {
+      "role": "user",
+      "content": "What dependencies does Cargo.toml list? Read the file."
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read a UTF-8 text file from the project and return its contents.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "Path relative to the project root"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    }
+  ]
+}
