@@ -196,6 +196,8 @@ impl From<WireMessage> for Message {
     }
 }
 
+// Owned wire structs copy every message on each request. A borrowed
+// WireRequestMessage<'a> would remove the clones; worth it once histories get long (Phase 4).
 pub fn to_wire(m: &Message) -> WireRequestMessage {
     match m {
         Message::System(text) => WireRequestMessage {

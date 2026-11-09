@@ -49,6 +49,8 @@ pub async fn run(
             );
         }
 
+        // Cloned because the loop below still reads `reply`. Pushing after the
+        // tool loop would avoid it; one small copy per turn isn't worth the reorder.
         history.push(Message::Assistant {
             text: reply.text.clone(),
             tool_calls: reply.tool_calls.clone(),
