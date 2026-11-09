@@ -181,16 +181,16 @@ async fn run_command(cmd: &str, timeout: Duration) -> anyhow::Result<String> {
 // Keeps the first READ_LIMIT (+4, see read_file) bytes and returns the full
 // byte count. It keeps reading past the cap and throws the rest away: if it
 // stopped, the child would block on a full pipe and never exit.
-async fn read_capped(mut r: impl AsyncRead + Unpin) -> std::io::Result<(Vec<u8>, usize)> {
+async fn read_capped(mut r: impl AsyncRead + Unpin) -> std::io::Result<(Vec<u8>, u64)> {
     let mut kept = Vec::new();
-    let mut total = 0;
+    let mut total: u64 = 0; // u64, not usize: a 32-bit usize overflows at 4 GB
     let mut chunk = [0u8; 8192];
     loop {
         let n = r.read(&mut chunk).await?;
         if n == 0 {
             return Ok((kept, total));
         }
-        total += n;
+        total += n as u64;
         let room = (READ_LIMIT + 4).saturating_sub(kept.len());
         kept.extend_from_slice(&chunk[..n.min(room)]);
     }
@@ -237,10 +237,10 @@ async fn read_file(path: &str) -> anyhow::Result<String> {
         Err(_) => anyhow::bail!("{path} is not UTF-8 text"),
     };
 
-    Ok(truncate(contents, total as usize))
+    Ok(truncate(contents, total))
 }
 
-fn truncate(mut contents: String, total: usize) -> String {
+fn truncate(mut contents: String, total: u64) -> String {
     if contents.len() > READ_LIMIT {
         let keep = contents.floor_char_boundary(READ_LIMIT);
         contents.truncate(keep);
