@@ -5,7 +5,8 @@ use serde_json::{Value, json};
 use std::{fmt, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-const READ_LIMIT: usize = 20_000;
+// Fixed cap (~5k tokens worst case); size from the model's context in Phase 4.
+const READ_LIMIT: usize = 10_000;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,7 +123,7 @@ pub async fn run(
             if !approve(&args.command) {
                 return Ok(format!(
                     "The user declined to run this command: {}\n\
-                     Do not run it or a variant of it. Continue without it, \
+                     Do not run it again. Continue without it, \
                      or ask the user what to do instead.",
                     args.command
                 ));
@@ -150,6 +151,7 @@ async fn run_command(cmd: &str, timeout: Duration) -> anyhow::Result<String> {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("failed to start bash")?;
+    // Both streams are set to piped() above, so take() can't return None.
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
     let run = async { tokio::try_join!(read_capped(stdout), read_capped(stderr), child.wait()) };
