@@ -3,17 +3,16 @@ use crate::ollama;
 use crate::tools;
 use crate::{DIM, RESET};
 
-const MAX_TURNS: u32 = 10;
-
 pub async fn run(
     client: &reqwest::Client,
     url: &str,
     model: &str,
+    max_turns: u32,
     mut history: Vec<Message>,
     approve: impl Fn(&str) -> bool,
 ) -> anyhow::Result<String> {
     let specs = tools::specs();
-    for _ in 0..MAX_TURNS {
+    for _ in 0..max_turns {
         let reply = ollama::chat(client, url, model, &history, &specs).await?;
         if let Some(reasoning) = reply.reasoning {
             eprintln!("{DIM}{}{RESET}\n", reasoning.trim());
@@ -46,7 +45,10 @@ pub async fn run(
             history.push(tool_result);
         }
     }
-    anyhow::bail!("agent called for {MAX_TURNS} turns without resolving the request.")
+    anyhow::bail!(
+        "stopped after {max_turns} turns without a final answer. \
+         Rerun with a higher --max-turns, or give capy a smaller task."
+    )
 }
 
 #[cfg(test)]
@@ -125,9 +127,25 @@ mod tests {
         replies: Vec<Value>,
         approve: impl Fn(&str) -> bool,
     ) -> (anyhow::Result<String>, Vec<Value>) {
+        run_with_turns(replies, approve, 10).await
+    }
+
+    async fn run_with_turns(
+        replies: Vec<Value>,
+        approve: impl Fn(&str) -> bool,
+        max_turns: u32,
+    ) -> (anyhow::Result<String>, Vec<Value>) {
         let (url, seen) = fake_ollama(replies).await;
         let history = vec![Message::User("task".into())];
-        let out = run(&reqwest::Client::new(), &url, "fake", history, approve).await;
+        let out = run(
+            &reqwest::Client::new(),
+            &url,
+            "fake",
+            max_turns,
+            history,
+            approve,
+        )
+        .await;
         let requests = seen.lock().unwrap().clone();
         (out, requests)
     }
@@ -222,20 +240,19 @@ mod tests {
     #[tokio::test]
     async fn stops_after_max_turns() {
         // the model asks for the same file forever
-        let (out, requests) = run_with(
+        let (out, requests) = run_with_turns(
             vec![tool_reply(&[(
                 "c1",
                 "read_file",
                 json!({ "path": "Cargo.toml" }),
             )])],
             |_| true,
+            3,
         )
         .await;
-        assert!(
-            out.is_err(),
-            "expected an error after MAX_TURNS, got {out:?}"
-        );
-        assert_eq!(requests.len(), MAX_TURNS as usize);
+        let msg = format!("{:#}", out.expect_err("expected an error after 3 turns"));
+        assert!(msg.contains('3') && msg.contains("--max-turns"), "{msg}");
+        assert_eq!(requests.len(), 3);
     }
 
     // Runs one `touch {path}` call through the agent with the given approver.

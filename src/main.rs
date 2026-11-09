@@ -15,6 +15,10 @@ struct Args {
     #[arg(short, long, default_value = "qwen3.8-27b")]
     model: String,
 
+    /// Model calls before capy gives up on the task
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..))]
+    max_turns: u32,
+
     #[arg(long)]
     dry_run: bool,
 
@@ -95,7 +99,15 @@ async fn main() -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     println!(
         "{}",
-        agent::run(&client, &url, model, messages, prompt_approval).await?
+        agent::run(
+            &client,
+            &url,
+            model,
+            args.max_turns,
+            messages,
+            prompt_approval
+        )
+        .await?
     );
     Ok(())
 }
