@@ -41,7 +41,7 @@ pub async fn run(
                 call_id: tool.id.clone(),
                 content: tools::run(tool, &approve)
                     .await
-                    .unwrap_or_else(|e| format!("{e:#}")),
+                    .unwrap_or_else(|e| format!("error: {e:#}")),
             };
             history.push(tool_result);
         }
@@ -201,13 +201,21 @@ mod tests {
             .map(|r| r["tool_call_id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, ["c1", "c2", "c3"]);
+
+        let content: Vec<&str> = results
+            .iter()
+            .map(|r| r["content"].as_str().unwrap())
+            .collect();
+        // only a failed tool is marked; output and a decline are not
+        assert!(!content[0].starts_with("error:"), "{}", content[0]);
         // failures reach the model as text instead of ending the run
-        assert!(results[1]["content"].as_str().unwrap().contains("nope.txt"));
+        assert!(content[1].starts_with("error:"), "{}", content[1]);
+        assert!(content[1].contains("nope.txt"), "{}", content[1]);
+        assert!(!content[2].starts_with("error:"), "{}", content[2]);
         assert!(
-            results[2]["content"]
-                .as_str()
-                .unwrap()
-                .contains("The user declined to run this command")
+            content[2].contains("The user declined to run this command"),
+            "{}",
+            content[2]
         );
     }
 
