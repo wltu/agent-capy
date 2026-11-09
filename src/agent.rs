@@ -5,18 +5,29 @@ use crate::{DIM, RESET};
 use anyhow::Context;
 use std::time::Duration;
 
+// Settings for one run, fixed before it starts.
+pub struct Config {
+    pub url: String, // full chat completions URL
+    pub model: String,
+    pub max_turns: u32,
+    pub timeout: Duration, // per bash command
+}
+
 pub async fn run(
     client: &reqwest::Client,
-    url: &str,
-    model: &str,
-    max_turns: u32,
-    timeout: Duration, // per bash command
+    config: &Config,
     mut history: Vec<Message>,
     approve: impl Fn(&str) -> bool,
 ) -> anyhow::Result<String> {
+    let Config {
+        url,
+        model,
+        max_turns,
+        timeout,
+    } = config;
     let specs = tools::specs();
     let mut tools_run = 0;
-    for turn in 1..=max_turns {
+    for turn in 1..=*max_turns {
         // say what already happened: earlier commands' effects remain
         let reply = ollama::chat(client, url, model, &history, &specs)
             .await
@@ -58,7 +69,7 @@ pub async fn run(
             eprintln!("{DIM}→ {} {}{RESET}", tool.name, tool.arguments);
             let tool_result = Message::ToolResult {
                 call_id: tool.id.clone(),
-                content: tools::run(tool, &approve, timeout)
+                content: tools::run(tool, &approve, *timeout)
                     .await
                     .unwrap_or_else(|e| format!("error: {e:#}")),
             };
@@ -177,17 +188,14 @@ mod tests {
         max_turns: u32,
         timeout: Duration,
     ) -> anyhow::Result<String> {
-        let history = vec![Message::User("task".into())];
-        run(
-            &reqwest::Client::new(),
-            url,
-            "fake",
+        let config = Config {
+            url: url.into(),
+            model: "fake".into(),
             max_turns,
             timeout,
-            history,
-            approve,
-        )
-        .await
+        };
+        let history = vec![Message::User("task".into())];
+        run(&reqwest::Client::new(), &config, history, approve).await
     }
 
     // The full error chain, as main would print it.

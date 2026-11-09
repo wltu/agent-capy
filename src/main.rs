@@ -77,12 +77,15 @@ fn shown(cmd: &str) -> String {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let url = format!("{}/chat/completions", args.endpoint.trim_end_matches('/'));
-
-    let model = &args.model;
+    let config = agent::Config {
+        url: format!("{}/chat/completions", args.endpoint.trim_end_matches('/')),
+        model: args.model,
+        max_turns: args.max_turns,
+        timeout: tools::DEFAULT_TIMEOUT,
+    };
 
     // Diagnostics go to stderr, so stdout holds only the answer.
-    eprintln!("{DIM}→ {} @ {url}{RESET}", model);
+    eprintln!("{DIM}→ {} @ {}{RESET}", config.model, config.url);
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "unknown".into());
@@ -91,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
         message::Message::User(args.task),
     ];
     if args.dry_run {
-        let payload = ollama::build_request(model, &messages, &tools::specs());
+        let payload = ollama::build_request(&config.model, &messages, &tools::specs());
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
@@ -99,16 +102,7 @@ async fn main() -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     println!(
         "{}",
-        agent::run(
-            &client,
-            &url,
-            model,
-            args.max_turns,
-            tools::DEFAULT_TIMEOUT,
-            messages,
-            prompt_approval
-        )
-        .await?
+        agent::run(&client, &config, messages, prompt_approval).await?
     );
     Ok(())
 }
