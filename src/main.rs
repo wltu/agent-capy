@@ -104,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
             &url,
             model,
             args.max_turns,
+            tools::DEFAULT_TIMEOUT,
             messages,
             prompt_approval
         )

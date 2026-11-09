@@ -3,12 +3,14 @@ use crate::ollama;
 use crate::tools;
 use crate::{DIM, RESET};
 use anyhow::Context;
+use std::time::Duration;
 
 pub async fn run(
     client: &reqwest::Client,
     url: &str,
     model: &str,
     max_turns: u32,
+    timeout: Duration, // per bash command
     mut history: Vec<Message>,
     approve: impl Fn(&str) -> bool,
 ) -> anyhow::Result<String> {
@@ -56,7 +58,7 @@ pub async fn run(
             eprintln!("{DIM}→ {} {}{RESET}", tool.name, tool.arguments);
             let tool_result = Message::ToolResult {
                 call_id: tool.id.clone(),
-                content: tools::run(tool, &approve)
+                content: tools::run(tool, &approve, timeout)
                     .await
                     .unwrap_or_else(|e| format!("error: {e:#}")),
             };
@@ -164,7 +166,7 @@ mod tests {
         max_turns: u32,
     ) -> (anyhow::Result<String>, Vec<Value>) {
         let (url, seen) = fake_ollama(replies).await;
-        let out = run_at(&url, approve, max_turns).await;
+        let out = run_at(&url, approve, max_turns, tools::DEFAULT_TIMEOUT).await;
         let requests = seen.lock().unwrap().clone();
         (out, requests)
     }
@@ -173,6 +175,7 @@ mod tests {
         url: &str,
         approve: impl Fn(&str) -> bool,
         max_turns: u32,
+        timeout: Duration,
     ) -> anyhow::Result<String> {
         let history = vec![Message::User("task".into())];
         run(
@@ -180,6 +183,7 @@ mod tests {
             url,
             "fake",
             max_turns,
+            timeout,
             history,
             approve,
         )
@@ -259,8 +263,39 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
         drop(listener);
-        let msg = err_text(run_at(&url, |_| true, 10).await);
+        let msg = err_text(run_at(&url, |_| true, 10, tools::DEFAULT_TIMEOUT).await);
         assert!(msg.contains(&url), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn timed_out_command_is_an_error_result_and_the_run_continues() {
+        let (url, seen) = fake_ollama(vec![
+            (
+                200,
+                tool_reply(&[("c1", "bash", json!({ "command": "sleep 5" }))]).to_string(),
+            ),
+            (200, text_reply("gave up on sleep").to_string()),
+        ])
+        .await;
+        let start = std::time::Instant::now();
+        let out = run_at(&url, |_| true, 10, Duration::from_millis(200)).await;
+        assert!(start.elapsed() < Duration::from_secs(2), "waited for sleep");
+        assert_eq!(out.unwrap(), "gave up on sleep");
+
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2, "no second request after the timeout");
+        let result = messages(&requests, 1)
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("a tool result")["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(result.starts_with("error:"), "{result}");
+        assert!(
+            result.contains("timed out") && result.contains("200ms"),
+            "{result}"
+        );
     }
 
     #[tokio::test]

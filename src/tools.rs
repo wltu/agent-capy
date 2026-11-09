@@ -6,7 +6,7 @@ use std::{fmt, time::Duration};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const READ_LIMIT: usize = 20_000;
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolSpec {
@@ -88,7 +88,11 @@ struct BashArgs {
     command: String,
 }
 
-pub async fn run(call: &ToolCall, approve: impl Fn(&str) -> bool) -> anyhow::Result<String> {
+pub async fn run(
+    call: &ToolCall,
+    approve: impl Fn(&str) -> bool,
+    timeout: Duration,
+) -> anyhow::Result<String> {
     let name = call.name.as_str();
     match ALL_TOOLS.iter().find(|t| t.to_string() == name) {
         Some(Tool::ReadFile) => {
@@ -123,7 +127,7 @@ pub async fn run(call: &ToolCall, approve: impl Fn(&str) -> bool) -> anyhow::Res
                     args.command
                 ));
             }
-            run_command(&args.command, DEFAULT_TIMEOUT).await
+            run_command(&args.command, timeout).await
         }
         None => anyhow::bail!(
             "unknown tool {name}: available tools {}",
@@ -277,7 +281,7 @@ mod tests {
 
     // What the model would see: Ok text as-is, Err as its message chain.
     async fn model_sees(call: &ToolCall) -> String {
-        match run(call, |_| true).await {
+        match run(call, |_| true, DEFAULT_TIMEOUT).await {
             Ok(text) => text,
             Err(e) => format!("{e:#}"),
         }
@@ -285,9 +289,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_returns_contents() {
-        let out = run(&call("read_file", json!({ "path": "Cargo.toml" })), |_| {
-            true
-        })
+        let out = run(
+            &call("read_file", json!({ "path": "Cargo.toml" })),
+            |_| true,
+            DEFAULT_TIMEOUT,
+        )
         .await
         .unwrap();
         assert!(out.contains("[package]"), "{out}");
@@ -295,9 +301,13 @@ mod tests {
 
     #[tokio::test]
     async fn missing_file_is_err_naming_the_path() {
-        let err = run(&call("read_file", json!({ "path": "nope.txt" })), |_| true)
-            .await
-            .unwrap_err();
+        let err = run(
+            &call("read_file", json!({ "path": "nope.txt" })),
+            |_| true,
+            DEFAULT_TIMEOUT,
+        )
+        .await
+        .unwrap_err();
         // The model needs to know which path failed, not just "os error 2".
         assert!(format!("{err:#}").contains("nope.txt"), "{err:#}");
     }
@@ -366,9 +376,13 @@ mod tests {
             let body = format!("{prefix}{}", "é".repeat(500_000)); // ~1 MB
             std::fs::write(&path, &body).unwrap();
 
-            let out = run(&call("read_file", json!({ "path": path })), |_| true)
-                .await
-                .unwrap();
+            let out = run(
+                &call("read_file", json!({ "path": path })),
+                |_| true,
+                DEFAULT_TIMEOUT,
+            )
+            .await
+            .unwrap();
 
             assert!(
                 out.len() < body.len(),
@@ -463,9 +477,11 @@ mod tests {
     #[tokio::test]
     async fn empty_command_is_err_without_asking() {
         for cmd in ["", "   ", "\n\t"] {
-            let res = run(&call("bash", json!({ "command": cmd })), |_| {
-                panic!("asked to approve {cmd:?}")
-            })
+            let res = run(
+                &call("bash", json!({ "command": cmd })),
+                |_| panic!("asked to approve {cmd:?}"),
+                DEFAULT_TIMEOUT,
+            )
             .await;
             assert!(res.is_err(), "{cmd:?}: {res:?}");
         }
